@@ -1,0 +1,6 @@
+{
+  "brokers": ["broker1:9092", "broker2:9092", "broker3:9092"],
+  "consumer_group": "my-consumer-group",
+  "topic": "my-topic",
+  "lag_threshold": 1000
+}
