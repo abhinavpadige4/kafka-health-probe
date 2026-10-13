@@ -22,7 +22,7 @@ DEFAULT_LOG_FILE = "probe.log"
 def setup_logging(log_file: str):
     logger = logging.getLogger("kafka_probe")
     logger.setLevel(logging.INFO)
-    formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
     # stdout handler
     sh = logging.StreamHandler(sys.stdout)
     sh.setFormatter(formatter)
@@ -37,57 +37,64 @@ def load_config(path: str):
     p = Path(path)
     if not p.is_file():
         raise FileNotFoundError(f"Config file {path} not found")
-    if p.suffix.lower() in {".json"}:
-        return json.loads(p.read_text())
+    if p.suffix in {".json"}:
+        return json.load(p.open())
     try:
         import yaml
     except ImportError:
         raise ImportError("PyYAML is required for yaml config files")
-    return yaml.safe_load(p.read_text())
+    if p.suffix in {".yml", ".yaml"}:
+        return yaml.safe_load(p.open())
+    raise ValueError("Unsupported config file format")
 
-def exponential_backoff(attempt, base=1, factor=2, max_delay=60):
-    delay = min(base * (factor ** attempt), max_delay)
-    time.sleep(delay)
+def exponential_backoff(attempt, base=1, cap=60):
+    return min(cap, base * (2 ** attempt))
 
-def check_brokers(admin: AdminClient, logger):
-    try:
-        metadata = admin.list_topics(timeout=10)
-        brokers = metadata.brokers
-        logger.info(f"Connected brokers: {list(brokers.keys())}")
-        return True
-    except KafkaException as e:
-        logger.error(f"Failed to list brokers: {e}")
-        return False
-
-def check_consumer_group_lag(admin: AdminClient, group: str, topic: str, logger):
-    try:
-        # Get committed offsets for the group
-        group_offsets = admin.list_consumer_group_offsets(group, timeout=10)
-        # Get latest offsets for the topic partitions
-        md = admin.list_topics(topic, timeout=10)
-        partitions = md.topics[topic].partitions
-        tp_list = [f"{topic}:{p}" for p in partitions]
-        # Build TopicPartition objects
-        from confluent_kafka import TopicPartition
-        tps = [TopicPartition(topic, p) for p in partitions]
-        # Query watermarks (latest offsets)
-        watermarks = admin.get_watermark_offsets(tps, timeout=10)
-        total_lag = 0
-        for tp in tps:
-            committed = group_offsets.get(tp)
-            if committed is None:
-                committed_offset = 0
+def check_brokers(admin: AdminClient, logger, retries=3):
+    for attempt in range(retries + 1):
+        try:
+            metadata = admin.list_topics(timeout=10)
+            brokers = metadata.brokers
+            logger.info(f"Connected brokers: {[b.host for b in brokers.values()]}")
+            return True
+        except KafkaException as e:
+            logger.warning(f"Broker check failed (attempt {attempt+1}/{retries}): {e}")
+            if attempt < retries:
+                time.sleep(exponential_backoff(attempt))
             else:
-                committed_offset = committed.offset
-            high = watermarks[tp].high
-            lag = max(high - committed_offset, 0)
-            total_lag += lag
-            logger.info(f"Partition {tp.partition}: committed={committed_offset}, latest={high}, lag={lag}")
-        logger.info(f"Total lag for group '{group}' on topic '{topic}': {total_lag}")
-        return total_lag == 0
-    except KafkaException as e:
-        logger.error(f"Error checking consumer group lag: {e}")
-        return False
+                logger.error("Unable to connect to any broker after retries")
+                return False
+
+def get_consumer_group_lag(admin: AdminClient, group: str, topic: str, logger, retries=3):
+    for attempt in range(retries + 1):
+        try:
+            # fetch committed offsets for the group
+            committed = admin.list_consumer_group_offsets(group, timeout=10)
+            # fetch latest offsets for the topic partitions
+            md = admin.list_topics(topic, timeout=10)
+            partitions = md.topics[topic].partitions
+            latest = {}
+            for p_id in partitions:
+                tp = admin.topic_partition(topic, p_id)
+                low, high = admin.get_watermark_offsets(tp, timeout=10)
+                latest[p_id] = high
+            total_lag = 0
+            for tp, offset_meta in committed.items():
+                if tp.topic != topic:
+                    continue
+                committed_offset = offset_meta.offset
+                latest_offset = latest.get(tp.partition, 0)
+                lag = max(0, latest_offset - committed_offset)
+                total_lag += lag
+            logger.info(f"Consumer group '{group}' lag for topic '{topic}': {total_lag}")
+            return total_lag
+        except KafkaException as e:
+            logger.warning(f"Lag check failed (attempt {attempt+1}/{retries}): {e}")
+            if attempt < retries:
+                time.sleep(exponential_backoff(attempt))
+            else:
+                logger.error("Failed to retrieve consumer group lag after retries")
+                return None
 
 def main():
     parser = argparse.ArgumentParser(description="Kafka overnight health probe")
@@ -98,37 +105,37 @@ def main():
     logger = setup_logging(args.log_file)
     try:
         cfg = load_config(args.config)
-    except Exception as e:
-        logger.error(f"Failed to load config: {e}")
+    except Exception as exc:
+        logger.error(f"Failed to load config: {exc}")
         sys.exit(2)
 
     brokers = cfg.get("brokers")
     if not brokers:
-        logger.error("'brokers' not defined in config")
+        logger.error("'brokers' list missing in config")
         sys.exit(2)
 
-    admin_conf = {"bootstrap.servers": ",".join(brokers)}
-    admin = AdminClient(admin_conf)
+    admin_cfg = {"bootstrap.servers": ",".join(brokers)}
+    admin = AdminClient(admin_cfg)
 
-    max_retries = cfg.get("max_retries", 3)
-    success = False
-    for attempt in range(max_retries + 1):
-        logger.info(f"Probe attempt {attempt + 1}")
-        brokers_ok = check_brokers(admin, logger)
-        group_ok = True
-        if "consumer_group" in cfg and "topic" in cfg:
-            group_ok = check_consumer_group_lag(admin, cfg["consumer_group"], cfg["topic"], logger)
-        if brokers_ok and group_ok:
-            success = True
-            break
-        if attempt < max_retries:
-            exponential_backoff(attempt)
-    if not success:
-        logger.error("Kafka health probe failed after retries")
+    if not check_brokers(admin, logger):
         sys.exit(1)
+
+    group = cfg.get("consumer_group")
+    topic = cfg.get("topic")
+    if group and topic:
+        lag = get_consumer_group_lag(admin, group, topic, logger)
+        if lag is None:
+            sys.exit(1)
+        # define a threshold if needed
+        threshold = cfg.get("lag_threshold", 0)
+        if threshold and lag > threshold:
+            logger.error(f"Lag {lag} exceeds threshold {threshold}")
+            sys.exit(1)
     else:
-        logger.info("Kafka health probe succeeded")
-        sys.exit(0)
+        logger.info("Consumer group or topic not configured; skipping lag check")
+
+    logger.info("Kafka health probe completed successfully")
+    sys.exit(0)
 
 if __name__ == "__main__":
     main()
